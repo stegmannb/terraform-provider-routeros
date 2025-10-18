@@ -1,0 +1,314 @@
+name: Auto-Patch Upstream Provider
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  auto-patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/terraform-routeros/terraform-provider-routeros.git || true
+          git fetch upstream
+
+      - name: Check for new upstream commits
+        id: check-upstream
+        run: |
+          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+
+          echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+          echo "current_commit=$CURRENT_COMMIT" >> $GITHUB_OUTPUT
+
+          if git merge-base --is-ancestor $UPSTREAM_COMMIT HEAD; then
+            echo "up_to_date=true" >> $GITHUB_OUTPUT
+            echo "Already up to date with upstream"
+          else
+            echo "up_to_date=false" >> $GITHUB_OUTPUT
+            echo "New upstream commits available"
+
+            BEHIND_COUNT=$(git rev-list --count HEAD..upstream/main)
+            echo "behind_count=$BEHIND_COUNT" >> $GITHUB_OUTPUT
+            echo "Behind by $BEHIND_COUNT commits"
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check-upstream.outputs.up_to_date == 'false'
+        id: merge
+        run: |
+          echo "Merging upstream/main..."
+
+          if git merge upstream/main --no-edit; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "Merge successful"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "Merge conflicts detected"
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Apply patches
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.merge.outputs.success == 'true'
+        id: apply-patches
+        run: |
+          echo "Applying patches..."
+
+          PATCH_DIR=".github/patches"
+          if [ ! -d "$PATCH_DIR" ]; then
+            echo "Patch directory not found: $PATCH_DIR"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          PATCH_COUNT=$(ls -1 $PATCH_DIR/*.patch 2>/dev/null | wc -l)
+          if [ "$PATCH_COUNT" -eq 0 ]; then
+            echo "No patches found in $PATCH_DIR"
+            echo "success=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found $PATCH_COUNT patch(es) to apply"
+
+          FAILED_PATCHES=""
+          for patch in $PATCH_DIR/*.patch; do
+            echo "Applying: $(basename $patch)"
+            if git apply --check "$patch" 2>&1; then
+              git apply "$patch"
+              echo "  Applied successfully"
+            else
+              echo "  Failed to apply"
+              FAILED_PATCHES="$FAILED_PATCHES\n- $(basename $patch)"
+            fi
+          done
+
+          if [ -n "$FAILED_PATCHES" ]; then
+            echo "failed_patches<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$FAILED_PATCHES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "All patches applied successfully"
+          fi
+
+      - name: Setup Go
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.apply-patches.outputs.success == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test build
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.apply-patches.outputs.success == 'true'
+        id: build
+        run: |
+          echo "Building provider..."
+
+          if go build -o terraform-provider-routeros .; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "Build successful"
+
+            VERSION=$(./terraform-provider-routeros version 2>/dev/null || echo "unknown")
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "Build failed"
+            exit 1
+          fi
+
+      - name: Commit and push changes
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.build.outputs.success == 'true'
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          echo "Committing changes..."
+          git add -A
+
+          cat > /tmp/commit-msg.txt <<EOF
+          chore: sync with upstream and apply patches
+
+          Upstream commit: ${{ steps.check-upstream.outputs.upstream_commit }}
+          Behind by: ${{ steps.check-upstream.outputs.behind_count }} commits
+          Build: Success
+          Provider version: ${{ steps.build.outputs.version }}
+
+          Auto-generated by GitHub Actions
+          EOF
+
+          git commit -F /tmp/commit-msg.txt
+
+          echo "Pushing to fork..."
+          git push origin main
+
+          echo "Changes pushed successfully"
+
+      - name: Create issue on merge failure
+        if: failure() && steps.merge.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Auto-Patch: Merge Conflict with Upstream';
+            const body = `## Merge Conflict Detected
+
+            The automatic upstream merge has failed due to conflicts.
+
+            **Details:**
+            - Upstream commit: \`${{ steps.check-upstream.outputs.upstream_commit }}\`
+            - Behind by: ${{ steps.check-upstream.outputs.behind_count }} commits
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            **Action Required:**
+            1. Manually merge upstream changes
+            2. Resolve conflicts
+            3. Re-apply patches from \`.github/patches/\`
+            4. Test build
+            5. Push changes
+
+            **Commands:**
+            \`\`\`bash
+            git fetch upstream
+            git merge upstream/main
+            # Resolve conflicts
+            git apply .github/patches/*.patch
+            go build -o terraform-provider-routeros .
+            git push origin main
+            \`\`\`
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['auto-patch-failed', 'merge-conflict']
+            });
+
+      - name: Create issue on patch failure
+        if: failure() && steps.apply-patches.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Auto-Patch: Patch Application Failed';
+            const failedPatches = `${{ steps.apply-patches.outputs.failed_patches }}`;
+            const body = `## Patch Application Failed
+
+            One or more patches failed to apply cleanly.
+
+            **Details:**
+            - Upstream commit: \`${{ steps.check-upstream.outputs.upstream_commit }}\`
+            - Behind by: ${{ steps.check-upstream.outputs.behind_count }} commits
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            **Failed Patches:**
+            ${failedPatches}
+
+            **Possible Causes:**
+            - Upstream code has changed in the patched areas
+            - Patches need to be regenerated
+            - Fields might have been renamed/removed upstream
+
+            **Action Required:**
+            1. Check upstream changes in affected files
+            2. Manually apply patches or update them
+            3. Regenerate patch files if needed
+            4. Test build
+            5. Update patches in \`.github/patches/\`
+
+            **Regenerate Patches:**
+            \`\`\`bash
+            # Make manual fixes
+            git add -u
+            git commit -m "fix: update patches for new upstream"
+            git format-patch -1 HEAD -o .github/patches/ --force
+            \`\`\`
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['auto-patch-failed', 'patch-conflict']
+            });
+
+      - name: Create issue on build failure
+        if: failure() && steps.build.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Auto-Patch: Build Failed';
+            const body = `## Build Failed After Patching
+
+            The provider build failed after applying patches.
+
+            **Details:**
+            - Upstream commit: \`${{ steps.check-upstream.outputs.upstream_commit }}\`
+            - Behind by: ${{ steps.check-upstream.outputs.behind_count }} commits
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            **Possible Causes:**
+            - Go compilation errors in patched code
+            - Dependency issues
+            - API changes in upstream provider
+
+            **Action Required:**
+            1. Check workflow logs for build errors
+            2. Review patched files for compilation issues
+            3. Update patches if needed
+            4. Test build locally
+
+            **Local Testing:**
+            \`\`\`bash
+            go build -o terraform-provider-routeros .
+            \`\`\`
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['auto-patch-failed', 'build-error']
+            });
+
+      - name: Success summary
+        if: success() && steps.check-upstream.outputs.up_to_date == 'false'
+        run: |
+          echo "Auto-patch workflow completed successfully!"
+          echo ""
+          echo "Summary:"
+          echo "  - Upstream commits merged: ${{ steps.check-upstream.outputs.behind_count }}"
+          echo "  - Patches applied: Success"
+          echo "  - Build status: Success"
+          echo "  - Provider version: ${{ steps.build.outputs.version }}"
+          echo "  - Changes pushed to fork: Success"
+
+      - name: No updates summary
+        if: success() && steps.check-upstream.outputs.up_to_date == 'true'
+        run: |
+          echo "Already up to date with upstream"
+          echo "No action needed."

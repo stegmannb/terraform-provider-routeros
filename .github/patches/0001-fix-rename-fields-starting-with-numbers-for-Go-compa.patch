@@ -1,0 +1,54 @@
+From 3836a57319ff9887f98aa15e7f5f6e4d61083123 Mon Sep 17 00:00:00 2001
+From: Bastian Stegmann <bastian.stegmann@protonmail.com>
+Date: Sat, 18 Oct 2025 22:49:50 +0200
+Subject: [PATCH] fix: rename fields starting with numbers for Go compatibility
+
+- resource_ipv6_nd_prefix: 6to4_interface -> six_to_four_interface
+- resource_wifi_interworking: 3gpp_info -> three_gpp_info, 3gpp_raw -> three_gpp_raw
+- Add MetaTransformSet to preserve RouterOS API compatibility
+- Fixes Pulumi SDK generation (Go identifiers cannot start with digits)
+---
+ routeros/resource_ipv6_nd_prefix.go    | 3 ++-
+ routeros/resource_wifi_interworking.go | 5 +++--
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/routeros/resource_ipv6_nd_prefix.go b/routeros/resource_ipv6_nd_prefix.go
+index e3db0c9..e8621eb 100644
+--- a/routeros/resource_ipv6_nd_prefix.go
++++ b/routeros/resource_ipv6_nd_prefix.go
+@@ -24,8 +24,9 @@ func ResourceIpv6NdPrefix() *schema.Resource {
+ 	resSchema := map[string]*schema.Schema{
+ 		MetaResourcePath: PropResourcePath("/ipv6/nd/prefix"),
+ 		MetaId:           PropId(Id),
++		MetaTransformSet: PropTransformSet("six_to_four_interface:6to4-interface"),
+ 
+-		"6to4_interface": {
++		"six_to_four_interface": {
+ 			Type:     schema.TypeString,
+ 			Optional: true,
+ 			Description: "If this option is specified, this prefix will be combined with the IPv4 address of the interface " +
+diff --git a/routeros/resource_wifi_interworking.go b/routeros/resource_wifi_interworking.go
+index fa9c3f6..3dbe68f 100644
+--- a/routeros/resource_wifi_interworking.go
++++ b/routeros/resource_wifi_interworking.go
+@@ -44,14 +44,15 @@ func ResourceWifiInterworking() *schema.Resource {
+ 	resSchema := map[string]*schema.Schema{
+ 		MetaResourcePath: PropResourcePath("/interface/wifi/interworking"),
+ 		MetaId:           PropId(Id),
++		MetaTransformSet: PropTransformSet("three_gpp_info:3gpp-info", "three_gpp_raw:3gpp-raw"),
+ 
+-		"3gpp_info": {
++		"three_gpp_info": {
+ 			Type:        schema.TypeList,
+ 			Optional:    true,
+ 			Elem:        &schema.Schema{Type: schema.TypeString},
+ 			Description: "Cellular network advertisement information - country and network codes.",
+ 		},
+-		"3gpp_raw": {
++		"three_gpp_raw": {
+ 			Type:        schema.TypeString,
+ 			Optional:    true,
+ 			Description: "Cellular network advertisement information - country and network codes.",
+-- 
+2.51.0
+
