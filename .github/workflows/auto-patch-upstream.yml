@@ -67,6 +67,38 @@ jobs:
             exit 1
           fi
 
+      - name: Clean up .github directory
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.merge.outputs.success == 'true'
+        run: |
+          echo "Cleaning up .github directory..."
+
+          # Keep only our workflow and patches
+          KEEP_FILES=(
+            ".github/workflows/auto-patch-upstream.yml"
+            ".github/patches/0001-fix-rename-fields-starting-with-numbers-for-Go-compa.patch"
+          )
+
+          # Find all files in .github except the ones we want to keep
+          find .github -type f | while read file; do
+            SHOULD_KEEP=false
+            for keep in "${KEEP_FILES[@]}"; do
+              if [ "$file" = "$keep" ]; then
+                SHOULD_KEEP=true
+                break
+              fi
+            done
+
+            if [ "$SHOULD_KEEP" = false ]; then
+              echo "Removing: $file"
+              git rm -f "$file" || rm -f "$file"
+            fi
+          done
+
+          # Remove empty directories
+          find .github -type d -empty -delete
+
+          echo "Cleanup complete"
+
       - name: Apply patches
         if: steps.check-upstream.outputs.up_to_date == 'false' && steps.merge.outputs.success == 'true'
         id: apply-patches
