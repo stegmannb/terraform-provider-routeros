@@ -104,6 +104,45 @@ jobs:
 
           echo "Cleanup complete"
 
+      - name: Patch README with fork notice
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.merge.outputs.success == 'true'
+        run: |
+          echo "Adding fork notice to README..."
+
+          # Check if README already has the callout
+          if grep -q "Pulumi-Compatible Fork" README.md 2>/dev/null; then
+            echo "README already has fork notice, skipping..."
+          else
+            echo "Adding fork notice to README..."
+
+            # Create temporary file with callout (using printf to avoid YAML parsing issues)
+            printf '%s\n' \
+              '> [!NOTE]' \
+              '> **Pulumi-Compatible Fork**' \
+              '>' \
+              '> This is an auto-patched version of the [terraform-routeros/terraform-provider-routeros](https://github.com/terraform-routeros/terraform-provider-routeros) provider.' \
+              '> It has been modified to ensure compatibility with Pulumi by renaming fields that start with numbers (which are invalid in Go identifiers).' \
+              '>' \
+              '> - **All credit goes to the upstream maintainers**' \
+              '> - **For issues, please report to the [upstream repository](https://github.com/terraform-routeros/terraform-provider-routeros/issues)**' \
+              '> - This fork is automatically synchronized with upstream daily' \
+              '' \
+              > /tmp/readme_callout.txt
+
+            # Create new README with callout at the top (after title and badges)
+            {
+              head -n 3 README.md
+              echo ""
+              cat /tmp/readme_callout.txt
+              tail -n +4 README.md
+            } > README.md.new
+
+            mv README.md.new README.md
+            rm -f /tmp/readme_callout.txt
+
+            echo "README patched successfully"
+          fi
+
       - name: Apply patches
         if: steps.check-upstream.outputs.up_to_date == 'false' && steps.merge.outputs.success == 'true'
         id: apply-patches
