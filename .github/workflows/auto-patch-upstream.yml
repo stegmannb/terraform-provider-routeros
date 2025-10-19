@@ -3,7 +3,13 @@ name: Auto-Patch Upstream Provider
 on:
   schedule:
     - cron: '0 3 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_all_tags:
+        description: 'Force update all tags (ignore if already up-to-date)'
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: write
@@ -78,7 +84,6 @@ jobs:
             ".github/patches/0001-fix-rename-fields-starting-with-numbers-for-Go-compa.patch"
           )
 
-          # Find all files in .github except the ones we want to keep
           find .github -type f | while read file; do
             SHOULD_KEEP=false
             for keep in "${KEEP_FILES[@]}"; do
@@ -150,6 +155,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Cache Go dependencies
+        if: steps.check-upstream.outputs.up_to_date == 'false' && steps.apply-patches.outputs.success == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Test build
         if: steps.check-upstream.outputs.up_to_date == 'false' && steps.apply-patches.outputs.success == 'true'
@@ -344,3 +360,274 @@ jobs:
         run: |
           echo "Already up to date with upstream"
           echo "No action needed."
+
+  find-tags:
+    runs-on: ubuntu-latest
+    needs: auto-patch
+    if: always()
+    outputs:
+      tags: ${{ steps.get-tags.outputs.tags }}
+      tags_count: ${{ steps.get-tags.outputs.count }}
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/terraform-routeros/terraform-provider-routeros.git || true
+          git fetch upstream --tags
+
+      - name: Find tags to patch
+        id: get-tags
+        run: |
+          echo "Finding upstream tags (last 3 versions)..."
+          FORCE_ALL="${{ github.event.inputs.force_all_tags }}"
+          echo "Force all tags: $FORCE_ALL"
+
+          # Get last 3 version tags from upstream, sorted by version
+          UPSTREAM_TAGS=$(git ls-remote --tags upstream \
+            | grep -v '\^{}' \
+            | awk '{print $2}' \
+            | sed 's|refs/tags/||' \
+            | grep '^v[0-9]' \
+            | sort -V \
+            | tail -3)
+
+          echo "Upstream tags (last 3):"
+          echo "$UPSTREAM_TAGS"
+
+          # Filter to only tags that need updating
+          TAGS_TO_PATCH=""
+          for tag in $UPSTREAM_TAGS; do
+            echo "Checking tag: $tag"
+
+            # Get upstream commit for this tag
+            UPSTREAM_COMMIT=$(git ls-remote upstream "refs/tags/$tag" | awk '{print $1}')
+            echo "  Upstream commit: $UPSTREAM_COMMIT"
+
+            # If force_all_tags is true, skip checking and just add all tags
+            if [ "$FORCE_ALL" = "true" ]; then
+              echo "  Status: FORCE MODE - will update"
+              TAGS_TO_PATCH="$TAGS_TO_PATCH $tag"
+              continue
+            fi
+
+            # Check if fork has this tag
+            FORK_COMMIT=$(git rev-parse "refs/tags/$tag" 2>/dev/null || echo "")
+
+            if [ -z "$FORK_COMMIT" ]; then
+              echo "  Fork tag: does not exist - NEEDS PATCHING"
+              TAGS_TO_PATCH="$TAGS_TO_PATCH $tag"
+            else
+              echo "  Fork tag commit: $FORK_COMMIT"
+
+              # Check if fork's main is descendant of upstream tag commit
+              # This ensures our patched main includes the upstream tag
+              if git merge-base --is-ancestor "$UPSTREAM_COMMIT" HEAD; then
+                # Check if our tag points to current main (already patched)
+                if [ "$FORK_COMMIT" = "$(git rev-parse HEAD)" ]; then
+                  echo "  Status: up to date"
+                else
+                  echo "  Status: exists but outdated - NEEDS UPDATING"
+                  TAGS_TO_PATCH="$TAGS_TO_PATCH $tag"
+                fi
+              else
+                echo "  Status: upstream tag not yet merged to main - SKIP"
+              fi
+            fi
+          done
+
+          # Convert to JSON array
+          if [ -z "$TAGS_TO_PATCH" ]; then
+            echo "tags=[]" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "No tags need patching"
+          else
+            TAGS_JSON=$(echo "$TAGS_TO_PATCH" | tr ' ' '\n' | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "tags=$TAGS_JSON" >> $GITHUB_OUTPUT
+            TAG_COUNT=$(echo "$TAGS_TO_PATCH" | wc -w | tr -d ' ')
+            echo "count=$TAG_COUNT" >> $GITHUB_OUTPUT
+            echo "Tags to patch: $TAGS_TO_PATCH"
+            echo "Count: $TAG_COUNT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "Tag detection complete"
+          echo "Tags to patch: ${{ steps.get-tags.outputs.count }}"
+
+  patch-tags:
+    runs-on: ubuntu-latest
+    needs: find-tags
+    if: needs.find-tags.outputs.tags_count > 0
+    strategy:
+      matrix:
+        tag: ${{ fromJson(needs.find-tags.outputs.tags) }}
+      max-parallel: 3
+      fail-fast: false
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/terraform-routeros/terraform-provider-routeros.git || true
+          git fetch upstream --tags
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache Go dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Create tag from patched main
+        id: create-tag
+        run: |
+          TAG="${{ matrix.tag }}"
+          echo "Creating tag: $TAG"
+
+          # Get upstream commit for reference
+          UPSTREAM_COMMIT=$(git ls-remote upstream "refs/tags/$TAG" | awk '{print $1}')
+          echo "Upstream tag commit: $UPSTREAM_COMMIT"
+
+          # Get current main commit (already patched)
+          MAIN_COMMIT=$(git rev-parse HEAD)
+          echo "Fork main commit: $MAIN_COMMIT"
+
+          # Verify that main includes the upstream tag
+          if ! git merge-base --is-ancestor "$UPSTREAM_COMMIT" HEAD; then
+            echo "Error: Upstream tag $TAG is not in fork's main history"
+            echo "This should not happen - the auto-patch job should have merged it"
+            exit 1
+          fi
+
+          # Create annotated tag pointing to current main
+          git tag -fa "$TAG" -m "Patched version of upstream $TAG
+
+          Upstream commit: $UPSTREAM_COMMIT
+          Fork commit: $MAIN_COMMIT
+          Patches applied:
+          - Pulumi compatibility fixes (field renaming)
+          - Upstream .github files removed
+
+          Auto-generated by GitHub Actions
+          Workflow: ${{ github.workflow }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "Tag created successfully"
+          echo "success=true" >> $GITHUB_OUTPUT
+
+      - name: Test build for tag
+        id: build
+        run: |
+          echo "Building provider for tag ${{ matrix.tag }}..."
+
+          if go build -o terraform-provider-routeros .; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "Build successful"
+
+            VERSION=$(./terraform-provider-routeros version 2>/dev/null || echo "unknown")
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Provider version: $VERSION"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "Build failed"
+            exit 1
+          fi
+
+      - name: Push tag
+        if: steps.build.outputs.success == 'true'
+        run: |
+          TAG="${{ matrix.tag }}"
+          echo "Pushing tag $TAG to fork..."
+
+          # Force push the tag (will overwrite if exists)
+          git push origin "refs/tags/$TAG" --force
+
+          echo "Tag pushed successfully"
+
+      - name: Create issue on tag failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ matrix.tag }}';
+            const title = `Auto-Patch: Tag ${tag} Failed`;
+            const body = `## Tag Patching Failed
+
+            Failed to create/update tag: \`${tag}\`
+
+            **Details:**
+            - Tag: ${tag}
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            **Possible Causes:**
+            - Build failure for this tag
+            - Tag commit not in main history
+            - Git push failure
+
+            **Action Required:**
+            1. Check workflow logs
+            2. Verify main branch includes upstream tag commit
+            3. Try manual tag creation:
+
+            \`\`\`bash
+            git fetch upstream --tags
+            git checkout main
+            git tag -fa ${tag} -m "Patched ${tag}"
+            git push origin refs/tags/${tag} --force
+            \`\`\`
+            `;
+
+            // Check if issue already exists
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['auto-patch-failed', 'tag-failed'],
+              state: 'open'
+            });
+
+            const existingIssue = existingIssues.data.find(issue =>
+              issue.title === title
+            );
+
+            if (!existingIssue) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['auto-patch-failed', 'tag-failed']
+              });
+            }
+
+      - name: Success summary
+        if: success()
+        run: |
+          echo "Tag ${{ matrix.tag }} patched successfully!"
+          echo "  - Build status: Success"
+          echo "  - Provider version: ${{ steps.build.outputs.version }}"
+          echo "  - Tag pushed: Success"
