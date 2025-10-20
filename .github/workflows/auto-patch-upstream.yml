@@ -418,7 +418,7 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/terraform-routeros/terraform-provider-routeros.git || true
-          git fetch upstream --tags
+          git fetch upstream --tags --force
 
       - name: Find tags to patch
         id: get-tags
@@ -524,7 +524,7 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/terraform-routeros/terraform-provider-routeros.git || true
-          git fetch upstream --tags
+          git fetch upstream --tags --force
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -634,7 +634,7 @@ jobs:
             3. Try manual tag creation:
 
             \`\`\`bash
-            git fetch upstream --tags
+            git fetch upstream --tags --force
             git checkout main
             git tag -fa ${tag} -m "Patched ${tag}"
             git push origin refs/tags/${tag} --force
